@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.bak
+*.swp
+.env
+
+# Project data (downloaded papers, indexes, figures)
+data/
+
+# IDE / Tools
+.reasonix/
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
