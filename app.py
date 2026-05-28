@@ -404,35 +404,13 @@ with tab3:
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            # 显示历史图床命中图片（最多 3 张，优先 figure/table）
-            if msg.get("figures"):
-                shown_figs = 0
-                for meta in sorted(msg["figures"], key=lambda x: (0 if x.get("figure_type","") in ("figure","table") else 1)):
-                    img = meta.get("image_blob")
-                    if img and shown_figs < 3:
-                        cap = meta.get("caption", "")[:80]
-                        src = meta.get("source", "")[:30]
-                        st.image(img, caption=f"🖼️ {cap} ({src})")
-                        shown_figs += 1
-            # 显示表格原图（从 SQLite 图床读取）
+            # 显示表格 HTML 内容
             if msg.get("tables"):
                 for ti, meta in enumerate(msg["tables"]):
-                    src = meta.get("source", "") or meta.get("paper_source", "")
-                    tid = meta.get("table_id", "")
-                    if src and tid:
-                        try:
-                            from src.parser.figure_extractor import get_figure
-                            fig = get_figure(src, tid)
-                            if fig:
-                                st.image(fig["image"], caption=f"📊 原图: {tid} ({src[:40]}...)")
-                                continue
-                        except Exception:
-                            pass
-                    # 降级：显示 HTML 内容
                     html_raw = meta.get("full_html_content", "")
                     if html_raw:
                         html_clean = html_raw.replace("[TABLE_HTML:","").replace("[/TABLE_HTML]","").strip()
-                        st.caption(f"📊 {meta.get('table_id',f'表格{ti+1}')} (文本提取)")
+                        st.caption(f"📊 {meta.get('table_id',f'表格{ti+1}')}")
                         st.markdown(html_clean, unsafe_allow_html=True)
 
     question = st.chat_input("输入关于论文的问题…")
@@ -625,41 +603,18 @@ with tab3:
                 log.update(label="✅ 完成", state="complete", expanded=False)
                 st.markdown(answer)
 
-                # 显示图床命中图片（最多 5 张，优先 figure/table 类型）
-                shown_figs = 0
-                for meta in sorted(figure_chunks, key=lambda x: (0 if x.get("figure_type","") in ("figure","table") else 1)):
-                    img = meta.get("image_blob")
-                    if img and shown_figs < 5:
-                        cap = meta.get("caption", "")[:80]
-                        src = meta.get("source", "")[:30]
-                        st.image(img, caption=f"🖼️ {cap} ({src})")
-                        shown_figs += 1
-                # 显示表格原图（从 SQLite 读取）
+                # 显示表格 HTML 内容
                 for ti, meta in enumerate(table_chunks):
-                    src = meta.get("source", "")
-                    tid = meta.get("table_id", "")
-                    shown = False
-                    if src and tid:
-                        try:
-                            from src.parser.figure_extractor import get_figure
-                            fig = get_figure(src, tid)
-                            if fig:
-                                st.image(fig["image"], caption=f"📊 原图: {tid} ({src[:40]}...)")
-                                shown = True
-                        except Exception:
-                            pass
-                    if not shown:
-                        html_raw = meta.get("full_html_content", "")
-                        if html_raw:
-                            html_clean = html_raw.replace("[TABLE_HTML:","").replace("[/TABLE_HTML]","").strip()
-                            st.caption(f"📊 {meta.get('table_id',f'表格{ti+1}')} (文本提取)")
-                            st.markdown(html_clean, unsafe_allow_html=True)
+                    html_raw = meta.get("full_html_content", "")
+                    if html_raw:
+                        html_clean = html_raw.replace("[TABLE_HTML:","").replace("[/TABLE_HTML]","").strip()
+                        st.caption(f"📊 {meta.get('table_id',f'表格{ti+1}')}")
+                        st.markdown(html_clean, unsafe_allow_html=True)
             else:
                 log.update(label="⚠️ 无结果", state="error"); answer = "未检索到相关内容。"; st.markdown(answer)
 
             st.session_state.chat_messages.append({"role":"user","content":question})
-            st.session_state.chat_messages.append({"role":"assistant","content":answer,"tables":table_chunks if table_chunks else [],
-                                                     "figures":figure_chunks if figure_chunks else []})
+            st.session_state.chat_messages.append({"role":"assistant","content":answer,"tables":table_chunks if table_chunks else []})
             st.session_state.conversation_memory.update(question, answer)
             st.rerun()
 

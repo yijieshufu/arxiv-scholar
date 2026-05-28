@@ -643,7 +643,7 @@ class RetrievalPipeline:
 
         # ── 提取表格引用（模糊容错：可识别 Table4, Tab.4, able 4 等变体）──
         table_filter = None
-        m = re.search(r'(?:[Tt]able|[Tt]ab\b|[Aa]ble|表)\s*[-_.]?\s*(\d+)', query)
+        m = re.search(r'(?:(?:[Tt]able|[Tt]ab)\b|表)\s*[-_.]?\s*(\d+)', query)
         if m:
             table_id = f"Table_{m.group(1)}"
             table_filter = {"table_id": table_id}
