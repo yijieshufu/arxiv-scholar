@@ -91,7 +91,9 @@ class ArxivConfig:
 @dataclass
 class ParserConfig:
     """文档解析配置 — 参考 paper-qa 使用 pdfplumber + PyPDF2 双引擎"""
-    pdf_engine: Literal["docling", "pypdf2", "pdfplumber", "auto"] = "docling"
+    pdf_engine: Literal["docling", "mineru", "pypdf2", "pdfplumber", "auto"] = "mineru"
+    mineru_upload_url: str = field(default_factory=lambda: os.getenv("MINERU_UPLOAD_URL", ""))
+    mineru_api_key: str = field(default_factory=lambda: os.getenv("MINERU_API_KEY", ""))
     table_format: Literal["html", "markdown"] = "html"
     max_pages: int = 50                # 论文通常 < 50 页
     extract_references: bool = True     # 提取参考文献
@@ -101,8 +103,8 @@ class ParserConfig:
 class ChunkerConfig:
     """切片策略 — 论文感知：按章节边界切分"""
     strategy: Literal["semantic", "sentence", "section", "hierarchical"] = "section"
-    chunk_size: int = 400              # 论文段落较长，适当增大
-    chunk_overlap: int = 80
+    chunk_size: int = 512              # 学术段落长，512 tokens 更完整
+    chunk_overlap: int = 128            # 25% 重叠，避免关键句被切分到两个 chunk
     min_chunk_size: int = 100
     # 论文章节标记
     section_headers: List[str] = field(default_factory=lambda: [

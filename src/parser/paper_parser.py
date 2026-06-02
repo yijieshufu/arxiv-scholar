@@ -100,6 +100,8 @@ class PaperParser:
             return self._parse_with_pypdf2(path)
         elif self.engine == "docling":
             return self._parse_with_docling(path)
+        elif self.engine == "mineru":
+            return self._parse_with_mineru(path)
         else:
             raise ValueError(f"不支持的解析引擎: {self.engine}")
 
@@ -563,6 +565,75 @@ class PaperParser:
                 return len(reader.pages)
             except Exception:
                 return 0
+
+    def _parse_with_mineru(self, path: Path) -> Dict:
+        """
+        MinerU API 解析（需公网可访问的 PDF URL）。
+        流程：从 MINERU_UPLOAD_URL 拼接本地文件名 → 提交任务 → 轮询 → 下载结果。
+        失败时自动降级到 Docling。
+        """
+        import requests, json, time
+        from src.config import config
+
+        api_key = config.parser.mineru_api_key
+        upload_base = config.parser.mineru_upload_url
+        if not api_key or not upload_base:
+            logger.warning("MINERU_API_KEY 或 MINERU_UPLOAD_URL 未设置，降级到 Docling")
+            return self._parse_with_docling(path)
+
+        api_url = "https://mineru.net/api/v4/extract/task"
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+
+        # Step 1: 拼接公网 URL（用户需提前将 PDF 上传到该路径）
+        file_url = upload_base.rstrip("/") + "/" + path.name
+        logger.info(f"MinerU 提交: {file_url}")
+
+        try:
+            # Step 2: 提交解析任务
+            r = requests.post(api_url, headers=headers, json={
+                "url": file_url, "enable_formula": True, "enable_table": True,
+            }, timeout=30)
+            if r.status_code != 200:
+                logger.warning(f"MinerU 提交失败 ({r.status_code})，降级到 Docling")
+                return self._parse_with_docling(path)
+            task_id = r.json().get("data", {}).get("task_id", "")
+            if not task_id:
+                return self._parse_with_docling(path)
+            logger.info(f"MinerU 任务: {task_id}")
+
+            # Step 3: 轮询结果
+            for _ in range(60):
+                time.sleep(5)
+                r = requests.get(f"{api_url}/{task_id}", headers=headers, timeout=30)
+                if r.status_code != 200: continue
+                d = r.json().get("data", {})
+                st = d.get("status", "")
+                if st == "success":
+                    md_url = d.get("markdown_url", "")
+                    if md_url:
+                        md_resp = requests.get(md_url, timeout=60)
+                        markdown_text = md_resp.text
+                    else:
+                        markdown_text = d.get("content", "")
+                    break
+                elif st == "failed":
+                    logger.warning(f"MinerU 解析失败，降级到 Docling")
+                    return self._parse_with_docling(path)
+            else:
+                logger.warning("MinerU 超时，降级到 Docling")
+                return self._parse_with_docling(path)
+
+            tables = []
+            import re
+            for m in re.finditer(r'<table[^>]*>.*?</table>', markdown_text, re.DOTALL | re.IGNORECASE):
+                tables.append(f"[TABLE_HTML: Table]\n{m.group(0)}")
+            title = next((l[2:].strip() for l in markdown_text.split("\n") if l.startswith("# ")), "")
+            logger.info(f"MinerU 完成: {len(markdown_text)} chars, {len(tables)} tables")
+            return {"full_text": markdown_text, "pages": [markdown_text], "title": title,
+                    "abstract": "", "references": [], "tables": tables, "refs": []}
+        except Exception as e:
+            logger.warning(f"MinerU 失败 ({e})，降级到 Docling")
+            return self._parse_with_docling(path)
 
     def _parse_with_docling(self, path: Path) -> Dict:
         """
