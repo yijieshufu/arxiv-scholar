@@ -546,10 +546,24 @@ with tab3:
                 from src.prompts import QA_SYSTEM_PROMPT, TABLE_SYSTEM_PROMPT
                 from src.config import get_llm_client
                 llm = get_llm_client()
+                # 检测是否显式问章节（结论/方法/实验/Introduction/数字节号）→ 不显示表格
+                import re as _re
+                _asks_section = bool(_re.search(r'(?:Conclusion|Introduction|Method|Experiment|Related\s*Work|Background|Discussion)|\d+\.\s*(?:Conclusion|Introduction|Method)', question, _re.IGNORECASE))
                 for r in results[:5]:
                     meta = r.get("metadata", {}) if isinstance(r, dict) else {}
                     if meta.get("is_table") and meta.get("full_html_content"):
-                        table_chunks.append(meta)
+                        if _asks_section:
+                            pass  # 问章节时跳过表格
+                        else:
+                            table_chunks.append(meta)
+
+                def _shorten(s):
+                    name = s.replace('.pdf','').replace('_',' ')
+                    for p in ['a ','an ','the ']:
+                        if name.lower().startswith(p): name = name[len(p):]
+                    words = name.split()
+                    short = ' '.join(words[:4])
+                    return short if len(short) <= 40 else ' '.join(words[:3])
 
                 def _extract_text(r):
                     meta = r.get("metadata", {}) if isinstance(r, dict) else {}
@@ -557,7 +571,7 @@ with tab3:
                     return full[:2000] if full else (r.get("text","") if isinstance(r,dict) else "")[:1000]
 
                 prompt = TABLE_SYSTEM_PROMPT if table_chunks else QA_SYSTEM_PROMPT
-                ctx = "\n\n---\n\n".join([f"[{r.get('source','?')}]\n{_extract_text(r)}" for r in results[:5]])
+                ctx = "\n\n---\n\n".join([f"[{_shorten(r.get('source','?'))}]\n{_extract_text(r)}" for r in results[:5]])
                 # 往 LLM 上下文注入图床命中图表的 caption（让 LLM 知道实际有什么图）
                 if figure_chunks:
                     fig_notes = []

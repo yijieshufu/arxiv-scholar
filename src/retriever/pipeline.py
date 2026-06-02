@@ -648,7 +648,8 @@ class RetrievalPipeline:
             table_id = f"Table_{m.group(1)}"
             table_filter = {"table_id": table_id}
 
-        return paper_filter, section_filter, table_filter
+        has_section = section_filter is not None
+        return paper_filter, section_filter, table_filter, has_section
 
     # ── Filename-Based Paper Router ─────────────────────────────────────
 
@@ -846,7 +847,7 @@ class RetrievalPipeline:
         paper_locked = bool(filename_locked)
 
         # ── Step 1: 从查询中提取论文 + 章节 + 表格引用 ──
-        paper_ref, section_ref, table_ref = self._extract_refs(query_text)
+        paper_ref, section_ref, table_ref, has_section = self._extract_refs(query_text)
         table_val = table_ref.get("table_id") if table_ref else None
         paper_filter = self._resolve_paper_filter(paper_ref) if paper_ref else None
         if filename_locked:
