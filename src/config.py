@@ -91,7 +91,7 @@ class ArxivConfig:
 @dataclass
 class ParserConfig:
     """文档解析配置 — 参考 paper-qa 使用 pdfplumber + PyPDF2 双引擎"""
-    pdf_engine: Literal["docling", "mineru", "pypdf2", "pdfplumber", "auto"] = "mineru"
+    pdf_engine: Literal["docling", "mineru", "pypdf2", "pdfplumber", "auto"] = "docling"
     mineru_upload_url: str = field(default_factory=lambda: os.getenv("MINERU_UPLOAD_URL", ""))
     mineru_api_key: str = field(default_factory=lambda: os.getenv("MINERU_API_KEY", ""))
     table_format: Literal["html", "markdown"] = "html"
