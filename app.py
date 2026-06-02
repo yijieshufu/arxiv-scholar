@@ -571,7 +571,14 @@ with tab3:
                     return full[:2000] if full else (r.get("text","") if isinstance(r,dict) else "")[:1000]
 
                 prompt = TABLE_SYSTEM_PROMPT if table_chunks else QA_SYSTEM_PROMPT
-                ctx = "\n\n---\n\n".join([f"[{_shorten(r.get('source','?'))}]\n{_extract_text(r)}" for r in results[:5]])
+                ctx_parts = []
+                for r in results[:5]:
+                    meta = r.get("metadata", {}) if isinstance(r, dict) else {}
+                    src = _shorten(r.get("source", "?"))
+                    sec = meta.get("section_title", "") or meta.get("section_id", "")
+                    sec_str = f", {sec}" if sec else ""
+                    ctx_parts.append(f"[{src}{sec_str}]\n{_extract_text(r)}")
+                ctx = "\n\n---\n\n".join(ctx_parts)
                 # 往 LLM 上下文注入图床命中图表的 caption（让 LLM 知道实际有什么图）
                 if figure_chunks:
                     fig_notes = []
