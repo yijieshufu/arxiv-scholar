@@ -76,6 +76,16 @@ class Embedder:
                 self._model = _MODEL_CACHE[cache_key]
                 logger.info(f"复用模型缓存: {self.model_name} on {device}")
             else:
+                import os
+                if "TORCH_DEVICE" not in os.environ:
+                    os.environ["TORCH_DEVICE"] = device
+                import torch
+                if hasattr(torch, 'serialization') and hasattr(torch.serialization, 'add_safe_globals'):
+                    try:
+                        from huggingface_hub import PyTorchModelHubMixin
+                        torch.serialization.add_safe_globals([PyTorchModelHubMixin])
+                    except Exception:
+                        pass
                 from sentence_transformers import SentenceTransformer
                 self._model = SentenceTransformer(
                     self.model_name,

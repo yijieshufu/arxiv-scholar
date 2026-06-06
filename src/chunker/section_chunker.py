@@ -67,6 +67,14 @@ class SectionChunker:
     PATTERN_LETTER_SUB = re.compile(
         r"^(?:#+\s*)?([A-Z])\.\s+([A-Z][A-Za-z0-9].*)$"
     )
+    # 三级标题：小写字母加括号如 "a) xxx"、"b. xxx"
+    PATTERN_LOWER_LETTER = re.compile(
+        r"^(?:#+\s*)?([a-z])[\)\.]\s+([A-Za-z].*)$"
+    )
+    # 数字三级标题：如 "3.1.1 xxx"、"1.2.3 xxx"
+    PATTERN_ARABIC_THIRD = re.compile(
+        r"^(?:#+\s*)?(\d+\.\d+\.\d+)\s+([A-Za-z].*)$"
+    )
     PATTERN_KEYWORD = re.compile(
         r"^(?:#+\s*)?(Abstract|Introduction|Related\s*Work|Background|Method|"
         r"Experiment|Result|Discussion|Conclusion|Reference|Appendix)\s*$",

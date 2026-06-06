@@ -113,14 +113,48 @@ class QueryRewriter:
         return rewrites[:6]  # 最多 6 个
 
     def rewrite_for_arxiv(self, query: str) -> str:
-        """将查询改写为 ArXiv API 友好的英文学术搜索词"""
+        """将查询改写为 ArXiv API 友好的英文学术搜索词。
+
+        策略优先级：
+        1. 仅用 _academic_rewrite (LLM 直翻 2-5 个核心术语，不加限定词)
+        2. 若 academic 失败/返回中文/过长，降级到 keyword 提取
+        3. 最后才用 multi_query（取最短的英文候选）
+        """
         if not has_cjk(query):
             return query
-        rewrites = self.rewrite(query, strategy="chinese_academic")
-        for candidate in rewrites[1:]:
-            if candidate and not has_cjk(candidate):
-                return candidate
+
+        # Strategy 1: academic rewrite (single, tight, 2-5 terms)
         academic = self._academic_rewrite(query)
+        if academic and not has_cjk(academic):
+            # 如果太长(>8词)或含"and"串联过多概念，切取前 2 个关键词组
+            words = academic.split()
+            if len(words) > 8 or academic.count(" and ") >= 2:
+                # 尝试只保留前 3-5 个最核心的词
+                core = " ".join(words[:5])
+                logger.info(f"ArXiv 搜索改写 (裁剪): '{query}' → '{core}'")
+                return core
+            logger.info(f"ArXiv 搜索改写: '{query}' → '{academic}'")
+            return academic
+
+        # Strategy 2: keyword fallback (comma-separated → join as AND)
+        keywords = self._keyword_rewrite(query)
+        english_kw = [k for k in keywords if k and not has_cjk(k)]
+        if english_kw:
+            # 取前 3 个关键词用空格拼接
+            candidate = " ".join(english_kw[:3])
+            if len(candidate.split()) <= 8:
+                logger.info(f"ArXiv 搜索改写 (keywords): '{query}' → '{candidate}'")
+                return candidate
+
+        # Strategy 3: multi_query last resort (shortest English candidate)
+        multi = self._multi_query_rewrite(query)
+        english_multi = [q for q in multi if q and not has_cjk(q)]
+        if english_multi:
+            # 选最短的（最聚焦）
+            candidate = min(english_multi, key=lambda x: len(x.split()))
+            logger.info(f"ArXiv 搜索改写 (multi最短): '{query}' → '{candidate}'")
+            return candidate
+
         return academic or query
 
     def _academic_rewrite(self, query: str) -> Optional[str]:
@@ -131,8 +165,9 @@ class QueryRewriter:
 2. 使用领域术语（如 "Transformer" → 保留, "图片识别" → "image recognition"）
 3. 中文问题必须翻译为英文医学/计算机/学术术语（如 "肠息肉" → "colorectal polyp detection"）
 4. 中英文混合时优先使用英文术语
-5. 保持简洁，不超过 30 个词
-6. 只返回改写后的查询，不要任何解释。"""
+5. **严格限制 2-5 个核心词，不要用 "and" 串联多个概念**。ArXiv 搜索越短越精准
+6. 示例：中文"肠息肉检测的深度学习方法" → "colorectal polyp detection"（不要写成 "colorectal polyp detection and segmentation and deep learning"）
+7. 只返回改写后的查询，不要任何解释。"""
 
         try:
             resp = self.llm.chat.completions.create(

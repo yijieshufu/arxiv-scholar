@@ -568,72 +568,106 @@ class PaperParser:
 
     def _parse_with_mineru(self, path: Path) -> Dict:
         """
-        MinerU API 解析（需公网可访问的 PDF URL）。
-        流程：从 MINERU_UPLOAD_URL 拼接本地文件名 → 提交任务 → 轮询 → 下载结果。
-        失败时自动降级到 Docling。
+        MinerU 多级解析：
+        1. v4 API + VLM 模型（需 COS URL，公式/表格最准）
+        2. Agent API v1 + pipeline 模型（免 Key，直接上传）
+        3. Docling 降级
         """
-        import requests, json, time
+        import requests, time, json
         from src.config import config
 
-        api_key = config.parser.mineru_api_key
-        upload_base = config.parser.mineru_upload_url
-        if not api_key or not upload_base:
-            logger.warning("MINERU_API_KEY 或 MINERU_UPLOAD_URL 未设置，降级到 Docling")
-            return self._parse_with_docling(path)
+        def _save_tables(md_text, pdf_name):
+            """提取 Markdown 中的表格存入 figures.db"""
+            tables = []
+            for m in re.finditer(r'<table[^>]*>.*?</table>', md_text, re.DOTALL | re.IGNORECASE):
+                tables.append(f"[TABLE_HTML: Table]\n{m.group(0)}")
+            try:
+                import sqlite3
+                _db = Path('data/figures/figures.db')
+                _db.parent.mkdir(parents=True, exist_ok=True)
+                _conn = sqlite3.connect(str(_db))
+                for ti, m in enumerate(re.finditer(r'<table[^>]*>.*?</table>', md_text, re.DOTALL | re.IGNORECASE), 1):
+                    _cap = ""
+                    for _l in reversed(md_text[:m.start()].split("\n")[-10:]):
+                        if not _l.startswith("|"):
+                            _c = re.sub(r'^#+\s*|^\*\*|\*\*$', '', _l).strip()
+                            if _c and 5 < len(_c) < 150: _cap = _c; break
+                    _conn.execute("INSERT OR REPLACE INTO figures(paper_source,figure_id,figure_type,caption,html_content,page_no) VALUES(?,?,?,?,?,?)",
+                        (pdf_name, f"Table_{ti}", "table", _cap, m.group(0), 0))
+                _conn.commit(); _conn.close()
+            except: pass
+            return tables
 
-        api_url = "https://mineru.net/api/v4/extract/task"
-        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
-
-        # Step 1: 拼接公网 URL（用户需提前将 PDF 上传到该路径）
-        file_url = upload_base.rstrip("/") + "/" + path.name
-        logger.info(f"MinerU 提交: {file_url}")
-
-        try:
-            # Step 2: 提交解析任务
-            r = requests.post(api_url, headers=headers, json={
+        def _parse_v4_vlm(pdf_path, pdf_name):
+            """v4 API + VLM 模型（通过 COS URL）"""
+            upload_base = config.parser.mineru_upload_url
+            api_key = config.parser.mineru_api_key
+            if not upload_base or not api_key:
+                return None
+            file_url = upload_base.rstrip("/") + "/" + pdf_name
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"}
+            r = requests.post("https://mineru.net/api/v4/extract/task", headers=headers, json={
                 "url": file_url, "enable_formula": True, "enable_table": True,
+                "is_ocr": False, "model_version": "vlm",
             }, timeout=30)
-            if r.status_code != 200:
-                logger.warning(f"MinerU 提交失败 ({r.status_code})，降级到 Docling")
-                return self._parse_with_docling(path)
+            if r.status_code != 200: return None
             task_id = r.json().get("data", {}).get("task_id", "")
-            if not task_id:
-                return self._parse_with_docling(path)
-            logger.info(f"MinerU 任务: {task_id}")
-
-            # Step 3: 轮询结果
-            for _ in range(60):
+            if not task_id: return None
+            for _ in range(12):  # 最多等 60s，VLM 太慢就降级
                 time.sleep(5)
-                r = requests.get(f"{api_url}/{task_id}", headers=headers, timeout=30)
+                r = requests.get(f"https://mineru.net/api/v4/extract/task/{task_id}", headers=headers, timeout=30)
                 if r.status_code != 200: continue
                 d = r.json().get("data", {})
-                st = d.get("status", "")
-                if st == "success":
+                if d.get("status") == "success":
                     md_url = d.get("markdown_url", "")
-                    if md_url:
-                        md_resp = requests.get(md_url, timeout=60)
-                        markdown_text = md_resp.text
-                    else:
-                        markdown_text = d.get("content", "")
-                    break
-                elif st == "failed":
-                    logger.warning(f"MinerU 解析失败，降级到 Docling")
-                    return self._parse_with_docling(path)
-            else:
-                logger.warning("MinerU 超时，降级到 Docling")
-                return self._parse_with_docling(path)
+                    md = requests.get(md_url, timeout=120).text if md_url else d.get("content", "")
+                    if md:
+                        tables = _save_tables(md, pdf_name)
+                        title = next((l[2:].strip() for l in md.split("\n") if l.startswith("# ")), "")
+                        return {"full_text": md, "pages": [md], "title": title, "abstract": "", "references": [], "tables": tables, "refs": []}
+                elif d.get("status") == "failed":
+                    return None
+            return None
 
-            tables = []
-            import re
-            for m in re.finditer(r'<table[^>]*>.*?</table>', markdown_text, re.DOTALL | re.IGNORECASE):
-                tables.append(f"[TABLE_HTML: Table]\n{m.group(0)}")
-            title = next((l[2:].strip() for l in markdown_text.split("\n") if l.startswith("# ")), "")
-            logger.info(f"MinerU 完成: {len(markdown_text)} chars, {len(tables)} tables")
-            return {"full_text": markdown_text, "pages": [markdown_text], "title": title,
-                    "abstract": "", "references": [], "tables": tables, "refs": []}
-        except Exception as e:
-            logger.warning(f"MinerU 失败 ({e})，降级到 Docling")
-            return self._parse_with_docling(path)
+        def _parse_agent(pdf_path, pdf_name):
+            """Agent API v1 + pipeline 模型（直接上传）"""
+            base = "https://mineru.net/api/v1/agent"
+            r = requests.post(f"{base}/parse/file", json={
+                "file_name": pdf_name, "enable_table": True, "enable_formula": True, "is_ocr": False,
+            }, timeout=30)
+            d = r.json()
+            if d.get("code") != 0: return None
+            tid = d["data"]["task_id"]
+            furl = d["data"]["file_url"]
+            import urllib3; urllib3.disable_warnings()
+            with open(str(pdf_path), "rb") as f:
+                up = urllib3.PoolManager().request("PUT", furl, body=f.read(),
+                    headers={"Content-Type": "application/octet-stream"})
+            if up.status not in (200, 201): return None
+            for _ in range(100):
+                time.sleep(3)
+                r = requests.get(f"{base}/parse/{tid}", timeout=30)
+                if r.status_code != 200: continue
+                d = r.json().get("data", {})
+                if d.get("state") == "done":
+                    md = requests.get(d.get("markdown_url", ""), timeout=60).text if d.get("markdown_url") else ""
+                    if md:
+                        tables = _save_tables(md, pdf_name)
+                        title = next((l[2:].strip() for l in md.split("\n") if l.startswith("# ")), "")
+                        return {"full_text": md, "pages": [md], "title": title, "abstract": "", "references": [], "tables": tables, "refs": []}
+                elif d.get("state") == "failed":
+                    return None
+            return None
+
+        import re
+        # 1. 优先 v4 + VLM（最准，需 COS + API Key）
+        result = _parse_v4_vlm(path, path.name)
+        if result: return result
+        # 2. 其次 Agent API + pipeline（免 Key）
+        result = _parse_agent(path, path.name)
+        if result: return result
+        # 3. 兜底 Docling
+        return self._parse_with_docling(path)
 
     def _parse_with_docling(self, path: Path) -> Dict:
         """

@@ -5,4 +5,5 @@ from src.prompts.prompts import (
     TABLE_SYSTEM_PROMPT,
     SurveyOutput,
     CompareOutput,
+    parse_structured_output,
 )

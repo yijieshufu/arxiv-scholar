@@ -355,7 +355,7 @@ class RetrievalPipeline:
         metadatas = []
         import re
 
-        for c in new_chunks:
+        for i, c in enumerate(new_chunks):
             meta = dict(c.metadata)
             raw_text = str(c.text)                       # 锁死原始未截断完整文本
             section = meta.get("section_title", "")
@@ -824,13 +824,16 @@ class RetrievalPipeline:
               use_rerank: bool = True,
               alpha: float = None,
               rewrite: bool = True,
-              chat_history: List[dict] = None) -> List[Dict]:
+              chat_history: List[dict] = None,
+              paper_filter: Dict = None) -> List[Dict]:
         """
         完整检索查询（含论文双重锁定 + 按论文域降级）。
 
         Args:
             chat_history: 可选。多轮对话历史，用于上下文感知查询改写。
                          格式 [{"role":"user"/"assistant", "content":...}]
+            paper_filter: 可选。外部传入的论文锁定，如 {"source__keyword": "xxx.pdf"}。
+                         若传入，将覆盖 filename router 推断结果。
         """
         top_k = top_k or config.retrieval.top_k_rerank
         alpha = alpha if alpha is not None else config.retrieval.alpha
@@ -848,6 +851,13 @@ class RetrievalPipeline:
                 logger.info("上下文改写: '%s' → '%s'", query_text[:60], contextualized[:80])
                 query_text = contextualized
 
+        # ── Step 0.5: 外部 paper_filter 优先解析 ──
+        _external_paper_filter = None
+        if paper_filter and "source__keyword" in paper_filter:
+            _external_paper_filter = self._resolve_paper_filter(paper_filter)
+            if _external_paper_filter:
+                logger.info("外部论文锁定: %s", _external_paper_filter["source"])
+
         # ── Step 1: 文件名前置硬判定（Boundless Paper Lock）──
         all_sources = self._get_all_sources()
         filename_locked = self.detect_paper_by_filename(query_text, all_sources)
@@ -856,13 +866,17 @@ class RetrievalPipeline:
         # ── Step 1: 从查询中提取论文 + 章节 + 表格引用 ──
         paper_ref, section_ref, table_ref, has_section = self._extract_refs(query_text)
         table_val = table_ref.get("table_id") if table_ref else None
-        paper_filter = self._resolve_paper_filter(paper_ref) if paper_ref else None
+        paper_filter_resolved = self._resolve_paper_filter(paper_ref) if paper_ref else None
         if filename_locked:
-            paper_filter = {"source": filename_locked}
+            paper_filter_resolved = {"source": filename_locked}
+        # ⚠️ 外部 paper_filter 优先级最高
+        if _external_paper_filter:
+            paper_filter_resolved = _external_paper_filter
 
         # ── Step 2: 多级降级检索 ──
         queries = [query_text]
-        if rewrite and not section_ref and not paper_ref:
+        # ⚠️ 如果已有 paper_filter，不启用 Query Rewrite（改写会冲淡论文锁定信号）
+        if rewrite and not section_ref and not paper_ref and not paper_filter_resolved:
             from src.query_rewriter import has_cjk
             strategy = "chinese_academic" if has_cjk(query_text) else "auto"
             queries = self.rewriter.rewrite(query_text, strategy=strategy)
@@ -872,14 +886,14 @@ class RetrievalPipeline:
         # 2a-table) 单表死锁：仅在目标 table_id 的 HTML 表块内检索
         if table_val:
             table_filter = {"table_id": table_val, "is_table": True}
-            if paper_filter:
-                table_filter = {**paper_filter, **table_filter}
+            if paper_filter_resolved:
+                table_filter = {**paper_filter_resolved, **table_filter}
             all_results = self._hybrid_search(
                 queries[:5], alpha, filter_dict=table_filter
             )
             candidates = self._fuse_scores(all_results, alpha)
             candidates.sort(key=lambda x: x["score"], reverse=True)
-            if not candidates and paper_filter:
+            if not candidates and paper_filter_resolved:
                 all_results = self._hybrid_search(
                     queries[:5],
                     alpha,
@@ -895,30 +909,30 @@ class RetrievalPipeline:
                 )
 
         # 2a) 双锁：paper + section（单表查询不走泛搜降级）
-        if not table_val and not candidates and paper_filter and section_ref:
-            combined = {**paper_filter, **section_ref}
+        if not table_val and not candidates and paper_filter_resolved and section_ref:
+            combined = {**paper_filter_resolved, **section_ref}
             all_results = self._hybrid_search(queries[:5], alpha, filter_dict=combined)
             candidates = self._fuse_scores(all_results, alpha)
             candidates.sort(key=lambda x: x["score"], reverse=True)
 
         # 2b) 论文硬锁（无章节号也强制单篇 PDF 内检索）
-        if not table_val and not candidates and paper_filter:
+        if not table_val and not candidates and paper_filter_resolved:
             if section_ref:
-                logger.info(f"双锁无结果，降级为论文内检索: {paper_filter}")
+                logger.info(f"双锁无结果，降级为论文内检索: {paper_filter_resolved}")
             elif paper_locked:
-                logger.info(f"Filename boundless lock: {paper_filter}")
-            all_results = self._hybrid_search(queries[:5], alpha, filter_dict=paper_filter)
+                logger.info(f"Filename boundless lock: {paper_filter_resolved}")
+            all_results = self._hybrid_search(queries[:5], alpha, filter_dict=paper_filter_resolved)
             candidates = self._fuse_scores(all_results, alpha)
             candidates.sort(key=lambda x: x["score"], reverse=True)
 
         # 2c) 仅章节过滤（无论文锁时）
-        if not table_val and not candidates and section_ref and not paper_filter:
+        if not table_val and not candidates and section_ref and not paper_filter_resolved:
             all_results = self._hybrid_search(queries[:5], alpha, filter_dict=section_ref)
             candidates = self._fuse_scores(all_results, alpha)
             candidates.sort(key=lambda x: x["score"], reverse=True)
 
         # 2d) 全库泛搜：仅当文件名路由与论文锁均未命中
-        if not table_val and not candidates and not paper_filter:
+        if not table_val and not candidates and not paper_filter_resolved:
             all_results = self._hybrid_search(queries[:5], alpha, filter_dict=None)
             candidates = self._fuse_scores(all_results, alpha)
             candidates.sort(key=lambda x: x["score"], reverse=True)
@@ -928,10 +942,10 @@ class RetrievalPipeline:
             fb_filter = None
             if table_val:
                 fb_filter = {"table_id": table_val, "is_table": True}
-                if paper_filter:
-                    fb_filter = {**paper_filter, **fb_filter}
-            elif paper_filter:
-                fb_filter = paper_filter
+                if paper_filter_resolved:
+                    fb_filter = {**paper_filter_resolved, **fb_filter}
+            elif paper_filter_resolved:
+                fb_filter = paper_filter_resolved
             candidates = self._vector_fallback(
                 query_text, top_k, filter_dict=fb_filter
             )

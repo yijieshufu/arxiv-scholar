@@ -91,7 +91,7 @@ class ArxivConfig:
 @dataclass
 class ParserConfig:
     """文档解析配置 — 参考 paper-qa 使用 pdfplumber + PyPDF2 双引擎"""
-    pdf_engine: Literal["docling", "mineru", "pypdf2", "pdfplumber", "auto"] = "mineru"
+    pdf_engine: Literal["docling", "mineru", "pypdf2", "pdfplumber", "auto"] = "pdfplumber"
     mineru_upload_url: str = field(default_factory=lambda: os.getenv("MINERU_UPLOAD_URL", ""))
     mineru_api_key: str = field(default_factory=lambda: os.getenv("MINERU_API_KEY", ""))
     table_format: Literal["html", "markdown"] = "html"
@@ -158,8 +158,8 @@ class RetrievalConfig:
 class RerankerConfig:
     """Rerank 配置"""
     engine: Literal["bge_reranker", "llm_rerank"] = "bge_reranker"
-    model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2"
-    # 放大模型（质量更高但更慢）："BAAI/bge-reranker-v2-m3"（~1.5GB, ~15s CPU）
+    model_name: str = "BAAI/bge-reranker-v2-m3"
+    # 轻量备选（更快但精度较低）："cross-encoder/ms-marco-MiniLM-L-6-v2"（~80MB, ~2s CPU）
     llm_model: str = "qwen-max"
     llm_score_weight: float = 0.7
     vector_score_weight: float = 0.3
@@ -237,21 +237,29 @@ def get_llm_client():
 
     支持：
     - DeepSeek:   base_url=https://api.deepseek.com/v1  model=deepseek-chat
-    - Ollama:     base_url=http://localhost:11434/v1     model=qwen2.5:7b
+    - Ollama:     base_url=http://localhost:11434/v1     model=qwen3:8b
     - DashScope:  base_url=https://dashscope.aliyuncs.com/compatible-mode/v1
     - OpenAI:     base_url=https://api.openai.com/v1
     - Kimi:       base_url=https://api.moonshot.cn/v1  model=kimi-k2.5
+    - vLLM:       base_url=http://localhost:8000/v1
     """
     base_url = config.llm.base_url
     api_key = config.llm.api_key
+    provider = config.llm.provider
 
     # 未显式设置时，按 provider 给默认值
-    if config.llm.provider == "kimi":
-        base_url = "https://api.moonshot.cn/v1"
+    if provider == "kimi":
+        base_url = base_url or "https://api.moonshot.cn/v1"
         api_key = api_key or os.getenv("KIMI_API_KEY", "")
-    elif config.llm.provider == "deepseek":
+    elif provider == "deepseek":
         base_url = base_url or "https://api.deepseek.com/v1"
         api_key = api_key or os.getenv("DEEPSEEK_API_KEY", "")
+    elif provider == "ollama":
+        base_url = base_url or "http://localhost:11434/v1"
+        api_key = "ollama"  # Ollama doesn't require an API key
+    elif provider == "vllm":
+        base_url = base_url or "http://localhost:8000/v1"
+        api_key = api_key or "token-abc"  # vLLM default token
 
     from openai import OpenAI
     return OpenAI(

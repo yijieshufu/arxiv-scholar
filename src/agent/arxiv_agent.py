@@ -2,11 +2,11 @@
 ArXiv Agent — 学术论文智能助手
 
 支持两种模式：
-1. 深思熟虑（deliberative）— 先规划再逐步执行
-2. 反应式（reactive）— 即时决策调用工具
+1. 深思熟虑（deliberative）— 先规划再逐步执行，plan → execute_plan
+2. 反应式（reactive）— ReAct 循环，LLM 即时决策调用工具
 
 Agent 工作流：
-用户问题 → Query 改写 → 搜索 ArXiv → 下载论文 → 构建索引 → RAG 检索 → LLM 生成综述
+用户问题 → Plan(LLM生成工具执行计划) → 动态执行工具链 → LLM 生成回答
 """
 import json
 import logging
@@ -18,6 +18,33 @@ from src.prompts import SURVEY_SYSTEM_PROMPT, COMPARE_SYSTEM_PROMPT, QA_SYSTEM_P
 from src.retriever.pipeline import RetrievalPipeline
 
 logger = logging.getLogger(__name__)
+
+# ── 工具映射：plan 中的 tool 名 → (tool_fn, 参数映射规则) ──
+_PLAN_TOOL_MAP = {
+    "search_papers": {
+        "fn_key": "search_papers",
+        "arg_map": {"query": "query", "max_results": "max_results"},
+    },
+    "download_paper": {
+        "fn_key": "download_paper",
+        "arg_map": {"arxiv_id": "arxiv_id"},
+    },
+    "rag_query": {
+        "fn_key": "rag_query",
+        "arg_map": {"query": "query", "top_k": "top_k"},
+    },
+    "rewrite_query": {
+        "fn_key": "rewrite_query",
+        "arg_map": {"query": "query", "strategy": "strategy"},
+    },
+}
+
+# ── 当 Plan 失败或未生成足够步骤时的兜底流程 ──
+# ── 当 Plan 失败时的兜底流程（本地论文库已有索引时跳过搜索下载）──
+_FALLBACK_PLAN = [
+    {"tool": "rewrite_query", "args": {"query": "__QUERY__", "strategy": "chinese_academic"}, "description": "改写查询为学术搜索词"},
+    {"tool": "rag_query", "args": {"query": "__QUERY__", "top_k": 8}, "description": "在本地论文库中 RAG 检索（兜底）"},
+]
 
 
 class ArxivAgent:
@@ -46,57 +73,67 @@ class ArxivAgent:
             self._llm_client = get_llm_client()
         return self._llm_client
 
-    def plan(self, user_query: str) -> List[str]:
+    def plan(self, user_query: str) -> List[Dict]:
         """
-        深思熟虑模式：先规划执行步骤。
+        深思熟虑模式：LLM 生成结构化的工具执行计划。
 
         Returns:
-            步骤描述列表
+            [{"tool": "search_papers", "args": {...}, "description": "..."}, ...]
+            空列表 = 规划失败，触发兜底流程
         """
-        plan_prompt = f"""你是一个学术研究助手的规划器。根据用户的问题，制定一个逐步执行计划。
+        tools_desc = []
+        for name, info in self.tools.items():
+            tools_desc.append(f"- {name}: {info['description']}  {info['signature']}")
+
+        plan_prompt = f"""你是一个学术研究助手的规划器。根据用户问题，生成一个工具调用计划。
 
 可用工具：
-1. search_papers — 搜索 ArXiv 论文
-2. download_paper — 下载论文 PDF 并入库
-3. rag_query — 检索本地论文库
-4. rewrite_query — 改写查询
+{chr(10).join(tools_desc)}
 
 用户问题：{user_query}
 
-返回 JSON 格式的执行步骤列表：
-{{"steps": ["步骤1描述", "步骤2描述", ...], "reasoning": "总体思路"}}"""
+生成一个 JSON 格式的执行计划。计划是一个步骤列表，每个步骤包含：
+- "tool": 工具名（必须是上面列出的工具之一）
+- "args": 工具参数字典
+- "description": 这一步在做什么（中文）
+
+重要规则：
+1. 如果用户用中文提问，第一步必须是 "rewrite_query" 将中文改写为英文学术搜索词
+2. 如果用户已经在问本地论文的问题（如"这篇论文的方法是什么""对比一下"），直接用 "rag_query"
+3. 如果用户要了解某个领域的最新进展，需要先 search_papers → download_paper → rag_query
+4. 计划 3-5 步，不要多余步骤
+
+返回格式（纯 JSON）：{{"steps": [{{"tool": "...", "args": {{}}, "description": "..."}}], "reasoning": "总体思路"}}"""
 
         try:
             resp = self.llm.chat.completions.create(
                 model=config.llm.model,
                 messages=[
-                    {"role": "system", "content": "你是任务规划器。只返回 JSON。"},
+                    {"role": "system", "content": "你是任务规划器。只返回 JSON，不要任何其他内容。"},
                     {"role": "user", "content": plan_prompt},
                 ],
                 temperature=0.1,
-                max_tokens=500,
+                max_tokens=800,
             )
             content = resp.choices[0].message.content
             s, e = content.find('{'), content.rfind('}') + 1
             if s >= 0 and e > s:
                 plan = json.loads(content[s:e])
-                return plan.get("steps", [])
+                steps = plan.get("steps", [])
+                reasoning = plan.get("reasoning", "")
+                if steps and reasoning:
+                    logger.info("LLM Plan (%s): %d steps", reasoning, len(steps))
+                return steps
         except Exception as e:
-            logger.warning(f"规划失败，使用默认流程: {e}")
+            logger.warning(f"LLM 规划失败，触发兜底流程: {e}")
 
-        return [
-            "改写查询为学术搜索词",
-            "搜索 ArXiv 相关论文",
-            "下载最相关的 3-5 篇论文",
-            "在本地论文库中 RAG 检索",
-            "生成综述回答",
-        ]
+        return []
 
     def execute(self, user_query: str,
                 max_papers: int = 5,
                 stream: bool = False) -> Dict:
         """
-        执行 Agent 流程。
+        执行 Agent 流程（plan → execute_plan → generate）。
 
         Args:
             user_query: 用户问题
@@ -104,85 +141,150 @@ class ArxivAgent:
             stream: 是否流式返回中间步骤
 
         Returns:
-            {"answer": str, "steps": [...], "papers": [...]}
+            {"answer": str, "steps": [...], "papers": [...], "plan": [...]}
         """
+        # ── Phase 1: Plan（LLM 生成工具执行计划）──
+        if self.mode == "deliberative":
+            plan_steps = self.plan(user_query)
+        else:
+            plan_steps = []
+
+        if not plan_steps:
+            # 兜底：使用预定义的默认流程
+            plan_steps = _FALLBACK_PLAN[:]
+            logger.info("使用兜底执行计划 (%d 步)", len(plan_steps))
+
+        # ── Phase 2: Execute Plan（动态执行工具链 + 占位符插值 + 中间失败容错）──
         steps_log = []
-        downloaded = []
+        context = {
+            "__QUERY__": user_query,
+            "__REWRITTEN__": user_query,
+            "__FIRST_RESULT_ID__": "",
+            "papers": [],
+            "max_papers": max_papers,
+            "downloaded": [],
+            "chunks": [],
+        }
 
-        # Step 1: Query 改写
-        try:
-            steps_log.append({"step": "query_rewrite", "status": "running"})
-            result = self.tools["rewrite_query"]["function"](user_query)
-            qr = json.loads(result)
-            search_query = qr.get("rewrites", [user_query])[1] if len(qr.get("rewrites", [])) > 1 else user_query
-            from src.query_rewriter import has_cjk, QueryRewriter
-            if has_cjk(user_query):
-                search_query = QueryRewriter().rewrite_for_arxiv(user_query)
-            steps_log[-1]["status"] = "done"
-            steps_log[-1]["result"] = search_query
-        except Exception as e:
-            search_query = user_query
-            steps_log[-1]["status"] = "failed"
-            steps_log[-1]["error"] = str(e)
+        for i, step in enumerate(plan_steps):
+            tool_name = step.get("tool", "")
+            raw_args = step.get("args", {})
+            description = step.get("description", f"Step {i+1}: {tool_name}")
 
-        # Step 2: 搜索 ArXiv
-        try:
-            steps_log.append({"step": "search_arxiv", "status": "running"})
-            result = self.tools["search_papers"]["function"](search_query, max_results=15)
-            search_data = json.loads(result)
-            papers = search_data.get("papers", [])
-            steps_log[-1]["status"] = "done"
-            steps_log[-1]["count"] = len(papers)
-        except Exception as e:
-            papers = []
-            steps_log[-1]["status"] = "failed"
-            steps_log[-1]["error"] = str(e)
+            # ═══ 插值替换占位符（__QUERY__, __FIRST_RESULT_ID__ 等）═══
+            resolved_args = {}
+            skip_this_step = False
+            for k, v in raw_args.items():
+                str_v = str(v)
+                for ctx_key, ctx_val in context.items():
+                    if isinstance(ctx_val, str):
+                        str_v = str_v.replace(ctx_key, ctx_val)
+                # 检测未解析的占位符（如 __FIRST_RESULT_ID__ 未找到论文）
+                if "__FIRST_RESULT_ID__" in str_v and not context.get("__FIRST_RESULT_ID__"):
+                    logger.warning(f"  ⏭️ 跳过 {tool_name}：无搜索结果可供下载")
+                    skip_this_step = True
+                    break
+                resolved_args[k] = str_v
 
-        if not papers:
-            return {"answer": "未找到相关论文，请尝试修改搜索词。", "steps": steps_log, "papers": []}
+            if skip_this_step:
+                steps_log.append({"step": tool_name, "status": "skipped",
+                                  "description": f"跳过: {description} (无可下载论文)"})
+                continue
 
-        # Step 3: 下载论文
-        try:
-            steps_log.append({"step": "download_papers", "status": "running"})
-            for paper in papers[:max_papers]:
-                result = self.tools["download_paper"]["function"](paper["arxiv_id"])
-                dl = json.loads(result)
-                if dl.get("success"):
-                    downloaded.append(dl)
+            # 类型转换
+            if "max_results" in resolved_args:
+                try: resolved_args["max_results"] = int(resolved_args["max_results"])
+                except (ValueError, TypeError): resolved_args["max_results"] = 15
+            if "top_k" in resolved_args:
+                try: resolved_args["top_k"] = int(resolved_args["top_k"])
+                except (ValueError, TypeError): resolved_args["top_k"] = 8
 
-            steps_log[-1]["status"] = "done"
-            steps_log[-1]["downloaded"] = len(downloaded)
-        except Exception as e:
-            steps_log[-1]["status"] = "failed"
-            steps_log[-1]["error"] = str(e)
+            logger.info(f"执行 Step {i+1}/{len(plan_steps)}: {tool_name} | {description}")
 
-        # Step 4: RAG 检索
-        try:
-            steps_log.append({"step": "rag_retrieve", "status": "running"})
-            result = self.tools["rag_query"]["function"](user_query, top_k=8)
-            retrieved = json.loads(result)
-            chunks = retrieved.get("results", [])
-            steps_log[-1]["status"] = "done"
-            steps_log[-1]["count"] = len(chunks)
-        except Exception as e:
-            chunks = []
-            steps_log[-1]["status"] = "failed"
-            steps_log[-1]["error"] = str(e)
+            step_record = {"step": tool_name, "status": "running", "description": description}
+            steps_log.append(step_record)
 
-        if not chunks:
-            # 如果本地索引没有（新下载的论文还没索引），用摘要回答
-            context = "\n\n---\n\n".join([
+            try:
+                tool_info = self.tools.get(tool_name)
+                if not tool_info:
+                    step_record["status"] = "failed"
+                    step_record["error"] = f"未知工具: {tool_name}"
+                    continue
+
+                fn = tool_info["function"]
+                result = fn(**resolved_args)
+                parsed = json.loads(result)
+
+                # ── 根据工具类型更新上下文 ──
+                if tool_name == "rewrite_query":
+                    rewrites = parsed.get("rewrites", [user_query])
+                    # 取第一个非原文的英文改写
+                    rewritten = user_query
+                    for rw in rewrites[1:]:
+                        if rw != user_query:
+                            rewritten = rw
+                            break
+                    context["__REWRITTEN__"] = rewritten
+                    step_record["result"] = rewritten
+                    step_record["status"] = "done"
+                    logger.info(f"  Query 改写: '{user_query[:40]}...' → '{rewritten[:40]}...'")
+
+                elif tool_name == "search_papers":
+                    papers = parsed.get("papers", [])
+                    context["papers"] = papers
+                    if papers:
+                        context["__FIRST_RESULT_ID__"] = papers[0].get("arxiv_id", "")
+                    step_record["count"] = len(papers)
+                    step_record["status"] = "done"
+                    logger.info(f"  搜索到 {len(papers)} 篇论文")
+
+                elif tool_name == "download_paper":
+                    if parsed.get("success"):
+                        context["downloaded"].append(parsed)
+                        step_record["result"] = parsed.get("title", "")
+                    step_record["status"] = "done"
+                    logger.info(f"  下载: {parsed.get('title', parsed.get('error', ''))}")
+
+                elif tool_name == "rag_query":
+                    chunks = parsed.get("results", [])
+                    context["chunks"] = chunks
+                    step_record["count"] = len(chunks)
+                    step_record["status"] = "done"
+                    logger.info(f"  RAG 检索: {len(chunks)} 个片段")
+
+                else:
+                    step_record["status"] = "done"
+
+            except Exception as e:
+                step_record["status"] = "failed"
+                step_record["error"] = str(e)
+                logger.warning(f"  Step {tool_name} 失败: {e}")
+
+        # ── Phase 3: Generate Answer（LLM 生成最终回答）──
+        papers = context["papers"]
+        chunks = context["chunks"]
+        downloaded = context["downloaded"]
+
+        if not chunks and not papers:
+            return {
+                "answer": "未能找到相关内容。请尝试修改搜索词后重试。",
+                "steps": steps_log,
+                "papers": [],
+                "plan": plan_steps,
+            }
+
+        # 如果 RAG 没检索到但搜到论文了，用摘要兜底
+        if not chunks and papers:
+            context_text = "\n\n---\n\n".join([
                 f"**{p.get('title', 'Unknown')}** ({', '.join(p.get('authors', [])[:3])})\n{p.get('abstract', '')}"
                 for p in papers[:max_papers]
             ])
-            chunks = [{"text": context, "source": "arxiv_abstracts"}]
+            chunks = [{"text": context_text, "source": "arxiv_abstracts"}]
 
-        # Step 5: LLM 生成综述
         try:
-            steps_log.append({"step": "generate_survey", "status": "running"})
+            steps_log.append({"step": "generate_answer", "status": "running", "description": "LLM 生成最终回答"})
 
             def _format_chunk(c):
-                """格式化单个 chunk：表格块展示完整 HTML，普通块截断文本。"""
                 source = c.get("source", "?")
                 title = c.get("paper_title", "")
                 section = c.get("section", "")
@@ -191,7 +293,7 @@ class ArxivAgent:
                     html = c.get("full_html", c.get("text", ""))
                     return (
                         f"{header} [TABLE: {c.get('table_id', '')}]\n"
-                        f"下面是该论文表格的 HTML 内容，请根据用户问题从表格中提取关键数据回答：\n"
+                        f"以下是表格 HTML 内容，请从表格中提取关键数据回答：\n"
                         f"```html\n{html}\n```"
                     )
                 else:
@@ -200,8 +302,6 @@ class ArxivAgent:
             context_text = "\n\n---\n\n".join([
                 _format_chunk(c) for c in chunks[:8]
             ])
-
-            from src.prompts import SURVEY_SYSTEM_PROMPT, SurveyOutput, parse_structured_output
 
             resp = self.llm.chat.completions.create(
                 model=config.llm.model,
@@ -215,7 +315,7 @@ class ArxivAgent:
             )
             raw = resp.choices[0].message.content
 
-            # Validate with Pydantic schema
+            # 尝试结构化输出
             validated = parse_structured_output(raw, SurveyOutput)
             if validated:
                 answer = (
@@ -229,11 +329,13 @@ class ArxivAgent:
                     f"**参考文献**\n\n" + "\n".join(f"- {r}" for r in validated.references)
                 )
             else:
-                answer = raw  # Fallback to raw output
+                answer = raw
+
             steps_log[-1]["status"] = "done"
         except Exception as e:
             answer = f"生成回答失败: {e}"
             steps_log[-1]["status"] = "failed"
+            steps_log[-1]["error"] = str(e)
 
         return {
             "answer": answer,
@@ -241,8 +343,9 @@ class ArxivAgent:
             "papers": [
                 {"title": p.get("title", ""), "arxiv_id": p.get("arxiv_id", ""),
                  "authors": p.get("authors", [])}
-                for p in papers[:max_papers]
+                for p in (papers[:max_papers] if papers else [])
             ],
+            "plan": plan_steps,
         }
 
     def quick_answer(self, query: str) -> str:

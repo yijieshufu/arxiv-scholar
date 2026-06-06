@@ -209,35 +209,30 @@ with tab1:
         search_btn = st.button("🔍 搜索", type="primary", use_container_width=True)
 
     st.caption("筛选条件（点击搜索时生效；分类可在左侧边栏设置）")
-    filter_row1 = st.columns([1, 1, 1, 1])
-    with filter_row1[0]:
-        enable_date_filter = st.checkbox("按日期筛选", value=False)
-    with filter_row1[1]:
-        date_from = st.date_input(
-            "起始日期",
-            value=date.today() - timedelta(days=365),
-            disabled=not enable_date_filter,
-        )
-    with filter_row1[2]:
-        date_to = st.date_input(
-            "结束日期",
-            value=date.today(),
-            disabled=not enable_date_filter,
-        )
-    with filter_row1[3]:
-        date_field_label = st.selectbox(
-            "日期依据",
-            ["提交日期", "更新日期"],
-            disabled=not enable_date_filter,
-        )
-    filter_row2 = st.columns([1, 1, 1])
+    # ⚠️ 仅当勾选"按日期筛选"时才启用日期过滤（默认关闭，防止日期泄露导致精度下降）
+    enable_date_filter = st.checkbox("按日期筛选", value=False, key="tab1_date_filter")
+    date_from = date.today() - timedelta(days=365)
+    date_to = date.today()
+    date_field_label = "提交日期"
+    if enable_date_filter:
+        filter_row1 = st.columns([1, 1, 1])
+        with filter_row1[0]:
+            date_from = st.date_input("起始日期", value=date_from)
+        with filter_row1[1]:
+            date_to = st.date_input("结束日期", value=date.today())
+        with filter_row1[2]:
+            date_field_label = st.selectbox("日期依据", ["提交日期", "更新日期"])
+
+    filter_row2 = st.columns([2, 2, 1])
     with filter_row2[0]:
         sort_by_label = st.selectbox(
             "排序方式",
             ["相关度", "提交日期", "更新日期"],
+            index=0,  # ⚠️ 强制默认相关度，防止 session 残留
+            key="tab1_sort_by",
         )
     with filter_row2[1]:
-        sort_order_label = st.selectbox("排序方向", ["降序", "升序"])
+        sort_order_label = st.selectbox("排序方向", ["降序", "升序"], index=0, key="tab1_sort_order")
     with filter_row2[2]:
         search_max_results = st.number_input("最多返回", min_value=5, max_value=50, value=15, step=5)
 
@@ -398,21 +393,30 @@ with tab2:
             step_container = st.container()
 
             with step_container:
-                st.info("🔄 Step 1/5: Query 改写...")
+                st.info("🧠 正在制定执行计划...")
 
             result = agent.execute(survey_topic, max_papers=max_papers)
 
-            # 显示步骤
+            # 显示步骤（展示 plan + 执行结果）
             with step_container:
                 st.success("✅ 完成！")
+
+                # 展示 LLM 生成的 plan
+                if result.get("plan"):
+                    with st.expander("📋 执行计划", expanded=True):
+                        for i, s in enumerate(result["plan"]):
+                            st.caption(f"{i+1}. [{s.get('tool','?')}] {s.get('description','')}")
+
                 for step in result["steps"]:
                     icon = "✅" if step["status"] == "done" else "❌"
                     detail = ""
                     if step.get("count"):
                         detail = f" ({step['count']} 条)"
                     elif step.get("result"):
-                        detail = f" → {step['result']}"
-                    st.text(f"  {icon} {step['step']}{detail}")
+                        result_str = str(step.get("result", ""))
+                        detail = f" → {result_str[:60]}"
+                    desc = step.get("description", step.get("step", ""))
+                    st.text(f"  {icon} {desc}{detail}")
 
         # 显示结果
         st.divider()
@@ -454,28 +458,38 @@ with tab3:
 
     # ── 论文选择（放聊天输入框上方） ──
     from src.retriever.paper_registry import PaperRegistry
+    from src.config import get_papers_dir
     _reg = PaperRegistry()
     _all_papers = _reg.list_papers()
+    # 如果 PaperRegistry 没有注册论文，回退到扫描 data/papers 目录
+    if not _all_papers:
+        _papers_dir = get_papers_dir()
+        _all_papers = [f.name for f in _papers_dir.glob("*.pdf")] if _papers_dir.exists() else []
     _paper_options = [(p, p.replace(".pdf","").replace("_"," ")[:60]) for p in _all_papers]
     if "selected_papers" not in st.session_state:
         st.session_state.selected_papers = []
+    # 清理 selected_papers 中已不存在的论文
+    st.session_state.selected_papers = [s for s in st.session_state.selected_papers if s in _all_papers]
     selected = []
     sel_cols = st.columns([1, 4])
     with sel_cols[0]:
         sel_label = st.markdown("**📚 论文：**")
     with sel_cols[1]:
-        sel_all = st.checkbox("全选", value=(len(st.session_state.selected_papers)==len(_all_papers)), key="sel_all")
-    sel_rows = [st.columns([2,2,2,2,2]) for _ in range((len(_paper_options)+4)//5)]
-    for i, (src, display) in enumerate(_paper_options):
-        row_idx, col_idx = i // 5, i % 5
-        with sel_rows[row_idx][col_idx]:
-            checked = st.checkbox(display, value=(src in st.session_state.selected_papers or sel_all), key=f"sel_{src}")
-            if checked:
-                selected.append(src)
-    if not sel_all:
-        st.session_state.selected_papers = selected
+        sel_all = st.checkbox("全选", value=(len(st.session_state.selected_papers)==len(_all_papers) and len(_all_papers) > 0), key="sel_all")
+    if _paper_options:
+        sel_rows = [st.columns([2,2,2,2,2]) for _ in range((len(_paper_options)+4)//5)]
+        for i, (src, display) in enumerate(_paper_options):
+            row_idx, col_idx = i // 5, i % 5
+            with sel_rows[row_idx][col_idx]:
+                checked = st.checkbox(display, value=(src in st.session_state.selected_papers or sel_all), key=f"sel_{src}")
+                if checked:
+                    selected.append(src)
+        if not sel_all:
+            st.session_state.selected_papers = selected
+        else:
+            st.session_state.selected_papers = [p[0] for p in _paper_options]
     else:
-        st.session_state.selected_papers = [p[0] for p in _paper_options]
+        st.session_state.selected_papers = []
     st.caption(f"已选 {len(st.session_state.selected_papers)} 篇" if st.session_state.selected_papers else "未选择 → 搜索全部论文")
 
     for msg in st.session_state.chat_messages:
@@ -504,7 +518,7 @@ with tab3:
                 if not ok:
                     st.warning(msg); st.stop()
 
-                # 从已选论文构造 paper_filter
+                # 从已选论文构造 paper_filter（精确锁定单篇论文）
                 _sel = st.session_state.get("selected_papers", [])
                 _paper_filter = {"source__keyword": _sel[0].replace(".pdf","")} if len(_sel) == 1 else None
                 results = pipeline.query(
@@ -512,6 +526,7 @@ with tab3:
                     top_k=config.retrieval.top_k_rerank if use_rerank else top_k,
                     use_rerank=use_rerank, alpha=alpha, rewrite=use_rewrite,
                     chat_history=st.session_state.chat_messages,
+                    paper_filter=_paper_filter,
                 )
 
             # 不走 st.status，直接显示答案
@@ -520,11 +535,15 @@ with tab3:
             # ── 额外搜图床：Figure/Table 原图匹配 ──
             try:
                 import re
-                fig_match = re.search(r'(?P<type>Figure|Fig\.?|Table|图|表)\s*(?P<num>\d+)', question, re.IGNORECASE)
-                if fig_match:
-                    t = fig_match.group("type").lower()
-                    want_type = "table" if t.startswith("table") or t == "表" else "figure"
-                    fig_num = fig_match.group("num")
+                # 扩展图表触发：精确 Figure/Table X 引用 + 图片/图表/示意图语义词
+                fig_match = re.search(r'(?P<type>Figure|Fig\.?|Table|Tab\.?|图|表|图表|图片|示意图|流程图|架构图|框图)\s*(?P<num>\d+)?', question, re.IGNORECASE)
+                # 如果没有数字编号但有图表关键词+论文名，也触发
+                has_visual_keyword = bool(re.search(r'(图|表|图表|图片|示意图|流程图|架构图|框图|figure|table|diagram|chart)', question, re.IGNORECASE))
+                has_paper_ref = bool(re.search(r'(这篇|这篇论文|该论文|论文中|文中|上述)', question))
+                if fig_match or (has_visual_keyword and has_paper_ref):
+                    t = (fig_match.group("type") or "").lower() if fig_match else ""
+                    want_type = "table" if (t.startswith("table") or t.startswith("tab") or t == "表") else "figure"
+                    fig_num = fig_match.group("num") if fig_match and fig_match.group("num") else ""
                     from src.parser.figure_extractor import search_figures_fts, get_page_images, get_paper_figures
                     paper_src = ""
                     # 优先从向量搜索结果的 source 确定论文
@@ -551,9 +570,13 @@ with tab3:
                             if s: paper_src = s; break
 
                     # 1. FTS5 全文搜图床（caption + page_text，支持 BM25 排序）
-                    fig_results = search_figures_fts(f"Figure {fig_num}", paper_source=paper_src)
-                    if not fig_results:
-                        fig_results = search_figures_fts(f"Fig_{fig_num}", paper_source=paper_src)
+                    if fig_num:
+                        fig_results = search_figures_fts(f"Figure {fig_num}", paper_source=paper_src)
+                        if not fig_results:
+                            fig_results = search_figures_fts(f"Fig_{fig_num}", paper_source=paper_src)
+                    else:
+                        # 无编号的图表查询：用查询文本直接全文搜
+                        fig_results = search_figures_fts(question[:100], paper_source=paper_src)
                     # 按查询类型过滤（问 Figure 只显示 figure，问 Table 只显示 table）
                     if fig_results:
                         fig_results = [r for r in fig_results if r.get("figure_type", "") == want_type]
@@ -702,13 +725,20 @@ with tab3:
                     answer = f"生成失败: {e}"
 
             if answer:
-                # Save for RAGAS eval
+                # Save for RAGAS eval — 累积保存最近 10 条 QA
+                if "qa_history" not in st.session_state:
+                    st.session_state.qa_history = []
+                st.session_state.qa_history.insert(0, {
+                    "question": question,
+                    "answer": answer,
+                    "contexts": results[:15] if results else [],
+                })
+                if len(st.session_state.qa_history) > 10:
+                    st.session_state.qa_history = st.session_state.qa_history[:10]
+                # 兼容旧 last_qa_* 变量
                 st.session_state.last_qa_question = question
                 st.session_state.last_qa_answer = answer
                 st.session_state.last_qa_contexts = results[:15] if results else []
-
-            if answer:
-                pass  # 完成
 
                 # 回答内容
                 st.markdown(answer)
@@ -785,16 +815,23 @@ with tab4:
             "Answer Relevancy（答案相关性）和 Context Precision（上下文精度）。"
         )
     with col_b:
-        if st.button("🧪 运行 RAGAS 评估", use_container_width=True):
-            if st.session_state.get("last_qa_contexts") and st.session_state.get("last_qa_answer"):
-                with st.spinner("LLM 评估中..."):
+        if st.button("🧪 批量评估", use_container_width=True):
+            qa_history = st.session_state.get("qa_history", [])
+            if not qa_history:
+                st.warning("请先在「论文问答」Tab 中进行问答")
+            else:
+                from src.evaluation.ragas_eval import RAGASEvaluator
+                evaluator = RAGASEvaluator()
+                total = len(qa_history)
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                for idx, qa in enumerate(qa_history):
+                    status_text.text(f"评估中 ({idx+1}/{total}): {qa['question'][:50]}...")
                     try:
-                        from src.evaluation.ragas_eval import RAGASEvaluator
-                        evaluator = RAGASEvaluator()
                         result = evaluator.evaluate_rag_response(
-                            question=st.session_state.get("last_qa_question", ""),
-                            answer=st.session_state.last_qa_answer,
-                            retrieved_chunks=st.session_state.last_qa_contexts,
+                            question=qa["question"],
+                            answer=qa["answer"],
+                            retrieved_chunks=qa["contexts"],
                         )
                         st.session_state.ragas_results.insert(0, {
                             "question": result.question[:80],
@@ -802,24 +839,49 @@ with tab4:
                             "answer_relevancy": result.answer_relevancy,
                             "context_precision": result.context_precision,
                             "error": result.error,
+                            "faith_reasoning": result.faithfulness_reasoning,
+                            "relev_reasoning": result.relevancy_reasoning,
+                            "ctxprec_reasoning": result.context_precision_reasoning,
                         })
-                        if len(st.session_state.ragas_results) > 10:
-                            st.session_state.ragas_results = st.session_state.ragas_results[:10]
-                        st.rerun()
                     except Exception as e:
-                        st.error(f"RAGAS 评估失败: {e}")
-            else:
-                st.warning("请先在「论文问答」Tab 中进行一次问答")
+                        st.session_state.ragas_results.insert(0, {
+                            "question": qa["question"][:80],
+                            "faithfulness": 0.0,
+                            "answer_relevancy": 0.0,
+                            "context_precision": 0.0,
+                            "error": str(e),
+                            "faith_reasoning": "",
+                            "relev_reasoning": "",
+                            "ctxprec_reasoning": "",
+                        })
+                    progress_bar.progress((idx + 1) / total)
+                # 截断保留最近 20 条
+                if len(st.session_state.ragas_results) > 20:
+                    st.session_state.ragas_results = st.session_state.ragas_results[:20]
+                status_text.text(f"✅ 已完成 {total} 条评估")
+                st.rerun()
 
     if st.session_state.ragas_results:
-        for i, r in enumerate(st.session_state.ragas_results[:5]):
+        for i, r in enumerate(st.session_state.ragas_results[:10]):
             cols = st.columns([3, 1, 1, 1])
             cols[0].markdown(f"**Q{i+1}:** {r['question']}")
             cols[1].metric("Faith.", f"{r['faithfulness']:.2f}", help="回答是否基于检索上下文")
             cols[2].metric("Relev.", f"{r['answer_relevancy']:.2f}", help="回答是否切题")
             cols[3].metric("Ctx Prec.", f"{r['context_precision']:.2f}", help="上下文是否相关")
+            if r.get("error"):
+                cols[0].caption(f"⚠️ {r['error'][:60]}")
+            # 显示评估理由
+            has_reasoning = any(r.get(k) for k in ("faith_reasoning", "relev_reasoning", "ctxprec_reasoning"))
+            if has_reasoning:
+                with st.expander(f"🔍 评估理由 (Q{i+1})", expanded=False):
+                    if r.get("faith_reasoning"):
+                        st.caption(f"**Faithfulness ({r['faithfulness']:.2f})**: {r['faith_reasoning']}")
+                    if r.get("relev_reasoning"):
+                        st.caption(f"**Relevancy ({r['answer_relevancy']:.2f})**: {r['relev_reasoning']}")
+                    if r.get("ctxprec_reasoning"):
+                        st.caption(f"**Context Precision ({r['context_precision']:.2f})**: {r['ctxprec_reasoning']}")
     else:
-        st.info("点击「运行 RAGAS 评估」按钮，基于最近一次问答结果评估生成质量")
+        st.info("点击「批量评估」按钮，评估最近的问答记录")
 
     st.divider()
     st.subheader("Langfuse 集成")
@@ -831,12 +893,56 @@ with tab4:
         st.info("配置 LANGFUSE_PUBLIC_KEY 和 LANGFUSE_SECRET_KEY 环境变量以启用 Langfuse")
 
     st.divider()
+    st.subheader("📋 Benchmark 批量评估")
+
+    col_bench_a, col_bench_b = st.columns([3, 1])
+    with col_bench_a:
+        st.markdown("运行 `scripts/run_ragas_eval.py` 脚本，对 10 条标注查询进行批量评估。")
+    with col_bench_b:
+        if st.button("📊 加载 Benchmark 结果", use_container_width=True):
+            bench_path = Path("data/test_bench/ragas_results.json")
+            if bench_path.exists():
+                with open(str(bench_path), "r", encoding="utf-8") as f:
+                    bench_data = json.load(f)
+                st.session_state.bench_data = bench_data
+                st.rerun()
+            else:
+                st.warning("未找到 benchmark 结果文件。请先在终端运行: python scripts/run_ragas_eval.py")
+
+    if st.session_state.get("bench_data"):
+        bd = st.session_state.bench_data
+        st.caption(f"测试时间: {bd.get('timestamp', 'N/A')} | 共 {bd.get('total_queries', 0)} 条查询")
+
+        if "retrieval" in bd:
+            with st.expander("🔍 检索指标", expanded=True):
+                rs = bd["retrieval"]["summary"]
+                rcols = st.columns(5)
+                rcols[0].metric("总查询数", rs.get("total", 0))
+                rcols[1].metric("平均延迟", f"{rs.get('avg_latency_ms', 0):.0f} ms")
+                rcols[2].metric("Avg NDCG@10", f"{rs.get('avg_ndcg@10', 0):.4f}")
+                rcols[3].metric("Avg MRR@10", f"{rs.get('avg_mrr@10', 0):.4f}")
+                rcols[4].metric("Avg Recall@10", f"{rs.get('avg_recall@10', 0):.4f}")
+
+        if "generation" in bd:
+            with st.expander("✨ 生成质量 (RAGAS)", expanded=True):
+                gs = bd["generation"]["summary"]
+                gcols = st.columns(4)
+                gcols[0].metric("Faithfulness", f"{gs.get('avg_faithfulness', 0):.3f}", help="回答是否基于检索上下文")
+                gcols[1].metric("Answer Relevancy", f"{gs.get('avg_answer_relevancy', 0):.3f}", help="回答是否切题")
+                gcols[2].metric("Context Precision", f"{gs.get('avg_context_precision', 0):.3f}", help="上下文是否相关")
+                gcols[3].metric("Context Recall", f"{gs.get('avg_context_recall', 0):.3f}", help="上下文是否覆盖 ground truth")
+
+            for qr in bd["generation"].get("per_query", [])[:5]:
+                st.caption(f"**{qr.get('id', '?')}**: {qr.get('query', '')[:60]}... → F={qr.get('faithfulness',0):.2f} R={qr.get('answer_relevancy',0):.2f}")
+
+    st.divider()
     st.subheader("技术栈一览")
     st.json({
         "RAG 链路": "PDF 解析 → 论文章节切片 → BGE-M3 向量化 → FAISS + BM25 混合检索 → BGE-Reranker 精排",
-        "Agent 模式": ["深思熟虑（先规划再执行）", "反应式（即时决策）"],
+        "Agent 模式": ["深思熟虑（LLM 规划 → 动态执行工具链）", "反应式（即时决策）"],
         "MCP 工具": list(MCP_TOOLS.keys()),
         "评估指标": config.evaluation.metrics,
+        "RAGAS 指标": ["Faithfulness", "Answer Relevancy", "Context Precision", "Context Recall"],
         "LLM": config.llm.model,
         "Embedding": config.embedding.model_name,
     })
