@@ -14,7 +14,7 @@ from typing import List, Dict, Optional
 
 from src.config import config
 from src.agent.tools import AGENT_TOOLS
-from src.prompts import SURVEY_SYSTEM_PROMPT, COMPARE_SYSTEM_PROMPT, QA_SYSTEM_PROMPT
+from src.prompts import SURVEY_SYSTEM_PROMPT, COMPARE_SYSTEM_PROMPT, QA_SYSTEM_PROMPT, SurveyOutput, CompareOutput, parse_structured_output
 from src.retriever.pipeline import RetrievalPipeline
 
 logger = logging.getLogger(__name__)
@@ -201,6 +201,8 @@ class ArxivAgent:
                 _format_chunk(c) for c in chunks[:8]
             ])
 
+            from src.prompts import SURVEY_SYSTEM_PROMPT, SurveyOutput, parse_structured_output
+
             resp = self.llm.chat.completions.create(
                 model=config.llm.model,
                 messages=[
@@ -209,8 +211,25 @@ class ArxivAgent:
                 ],
                 temperature=config.llm.temperature,
                 max_tokens=config.llm.max_tokens,
+                response_format={"type": "json_object"},
             )
-            answer = resp.choices[0].message.content
+            raw = resp.choices[0].message.content
+
+            # Validate with Pydantic schema
+            validated = parse_structured_output(raw, SurveyOutput)
+            if validated:
+                answer = (
+                    f"**综述概览**\n\n{validated.overview}\n\n"
+                    f"**论文分析**\n\n" + "\n\n".join(
+                        f"### {p.get('title', '')}\n- 方法: {p.get('method', '')}\n- 贡献: {p.get('contribution', '')}\n- 亮点: {p.get('highlights', '')}"
+                        for p in validated.papers
+                    ) + "\n\n" +
+                    f"**研究趋势**\n\n" + "\n".join(f"- {t}" for t in validated.trends) + "\n\n" +
+                    f"**结论**\n\n{validated.conclusion}\n\n" +
+                    f"**参考文献**\n\n" + "\n".join(f"- {r}" for r in validated.references)
+                )
+            else:
+                answer = raw  # Fallback to raw output
             steps_log[-1]["status"] = "done"
         except Exception as e:
             answer = f"生成回答失败: {e}"
@@ -251,7 +270,7 @@ class ArxivAgent:
                         f"下面是论文表格 HTML，请从中提取数据回答：\n"
                         f"```html\n{html}\n```"
                     )
-                return f"{header}\n{c['text'][:1000]}"
+                return f"{header}\n{c['text'][:1500]}"
 
             context_text = "\n\n---\n\n".join([
                 _fmt_q(c) for c in chunks[:5]

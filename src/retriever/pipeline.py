@@ -381,23 +381,30 @@ class RetrievalPipeline:
                 meta["contains_table"] = False
                 is_table_html = False
 
-            # ══════════════════════════════════════════════════════
-            # Phase 2: Embedding 输入 — 表块+论文信息前缀 => 区分跨论文同名表
-            # ══════════════════════════════════════════════════════
+            # Phase 2: Embedding input - context enrichment + prefix
+            # ==========================================================
             if is_table_html:
                 table_text = self._extract_table_text_for_embed(raw_text)
-                # 加论文前缀：同一个 Table_2 在不同论文中可区分
                 prefix = f"[{paper} {meta.get('table_id','')}] " if paper else ""
                 safe_text = (prefix + table_text)[:self._MAX_EMBED_CHARS]
             else:
-                if section and paper:
-                    prefix = f"[{paper}] {section}: "
-                elif section:
-                    prefix = f"{section}: "
-                else:
-                    prefix = ""
+                # Late Chunking enrichment:
+                # embed paper title + section header + previous chunk first sentence
+                parts = []
+                if paper:
+                    parts.append(f"[{paper}]")
+                if section:
+                    parts.append(f"Section: {section}")
+                prev_chunk = new_chunks[i - 1] if i > 0 else None
+                if prev_chunk and not prev_chunk.metadata.get("is_table"):
+                    prev_text = str(prev_chunk.text or "")
+                    prev_first_sentence = prev_text.split(".")[0][:150].replace("\n", " ")
+                    if prev_first_sentence.strip():
+                        parts.append(f"Prev: {prev_first_sentence.strip()}")
+                prefix = " | ".join(parts) + "\n" if parts else ""
                 safe_text = (prefix + raw_text)[:self._MAX_EMBED_CHARS]
-                safe_text = safe_text.replace("\x00", " ").replace("\ufffd", " ")
+                # normalize null bytes and unicode replacement characters
+                safe_text = safe_text.replace(chr(0), " ").replace(chr(0xfffd), " ")
 
             texts.append(safe_text)
 
@@ -1005,7 +1012,7 @@ class RetrievalPipeline:
 
     @staticmethod
     def _detect_intent(query: str) -> str:
-        """从查询中检测学术意图类型：dataset / experiment / config / general"""
+        """从查询中检测学术意图类型：dataset / experiment / config / architecture / general"""
         lower = query.lower()
         dataset_kw = {"数据集", "数据", "训练集", "测试集", "datasets", "data",
                       "benchmarks", "benchmark", "evaluation", "kvasir",
@@ -1014,6 +1021,12 @@ class RetrievalPipeline:
                          "experiment", "ablation", "comparison"}
         config_kw = {"参数", "配置", "setting", "implementation",
                      "parameter", "hyperparameter", "setup"}
+        architecture_kw = {"骨干", "backbone", "架构", "encoder", "decoder", "网络结构",
+                           "architecture", "module", "block", "head", "neck",
+                           "编码器", "解码器", "resnet", "vgg", "efficientnet",
+                           "transformer", "vit", "层次", "layer", "组件"}
+        if any(kw in lower for kw in architecture_kw):
+            return "architecture"
         if any(kw in lower for kw in dataset_kw):
             return "dataset"
         if any(kw in lower for kw in experiment_kw):
@@ -1025,6 +1038,10 @@ class RetrievalPipeline:
     @staticmethod
     def _section_intent_keywords(intent: str) -> set:
         """根据意图返回该类型论文章节常见的 section_title 关键词"""
+        if intent == "architecture":
+            return {"method", "model", "architecture", "network", "encoder",
+                    "decoder", "design", "approach", "framework", "implementation",
+                    "proposed", "pipeline", "ablation", "component"}
         if intent == "dataset":
             return {"dataset", "data", "benchmark", "evaluation", "experimental",
                     "setup", "material", "kvasir", "cvc", "colon"}
@@ -1294,7 +1311,7 @@ class RetrievalPipeline:
             if full_html:
                 txt = full_html[:1200].replace("\n", " ").replace("\r", " ")
             else:
-                txt = (c.get("text") or "")[:500].replace("\n", " ").replace("\r", " ")
+                txt = (c.get("text") or "")[:1500].replace("\n", " ").replace("\r", " ")
             lines.append(f"[ID: {i}] 章节: {title}\n内容: {txt}")
 
         context = "\n\n".join(lines)
@@ -1304,6 +1321,13 @@ class RetrievalPipeline:
             f"对以下论文片段按相关性从高到低排序。\n\n"
             f"用户查询: {query_text}\n\n"
             f"论文片段列表（共 {len(pool)} 条）:\n{context}\n\n"
+            f"【技术细节问题 — 章节优先级规则】\n"
+            f"如果用户询问具体的技术细节（如骨干网络名称、预训练数据集、参数设置、超参数、"
+            f"架构设计、损失函数等），必须优先排列来自 Method/Implementation/Experiment/"
+            f"Ablation Study 章节的片段。Conclusion 和 Introduction 章节通常只做概述性总结，"
+            f"不包含具体技术参数，对于技术细节类问题应排在 Method/Experiment 之后。\n"
+            f"例：用户问\"使用了什么骨干网络\"，Method 章节明确写明 \"Resnet-50 as backbone\" "
+            f"的片段应排第一，Conclusion 章节只说 \"redesign backbone structure\" 的片段应排在后面。\n\n"
             f"请严格按照从最相关到最不相关的顺序，"
             f"仅返回一个 JSON 格式的整数列表，格式如 [2,0,1,...]。\n"
             f"列表中应包含所有 {len(pool)} 个 ID，每个 ID 出现且仅出现一次。\n"

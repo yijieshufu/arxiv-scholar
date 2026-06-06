@@ -94,14 +94,19 @@ class QueryRewriter:
             keywords = self._keyword_rewrite(query)
             rewrites.extend([k for k in keywords if k != query])
 
-        # 去重保序
+        # 去重保序 + 过滤过短改写（"ResNet-50"/"ImageNet" 等无助于 BM25/向量检索的单词）
         seen = set()
         unique = []
         for q in rewrites:
             key = q.strip().lower()
             if key and key not in seen:
                 seen.add(key)
-                unique.append(q.strip())
+                # 过滤纯数字/短词/逗号分隔的短列表（如 "ResNet-50, ImageNet"）
+                stripped = q.strip()
+                word_count = len(stripped.split())
+                if word_count < 3:
+                    continue  # 少于 3 个词的改写无效
+                unique.append(stripped)
         rewrites = unique
 
         logger.info(f"Query 改写 [{strategy}]: {query[:50]}... → {len(rewrites)} 个查询")

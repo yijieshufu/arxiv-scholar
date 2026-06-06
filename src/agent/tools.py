@@ -80,7 +80,7 @@ def rag_query_tool(query: str, top_k: int = 5) -> str:
         def _format_result(r):
             meta = r.get("metadata", {})
             result = {
-                "text": r["text"][:500],
+                "text": r["text"][:1500],
                 "source": r["source"],
                 "score": r.get("rerank_score", r["score"]),
                 "paper_title": meta.get("paper_title", ""),

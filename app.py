@@ -76,6 +76,27 @@ with st.sidebar:
         st.caption(f"API: {config.embedding.api_model} | 维度: {config.embedding.dimension}")
 
     st.divider()
+    st.subheader("LLM 模型")
+    llm_provider = st.selectbox(
+        "LLM Provider",
+        ["deepseek", "kimi", "ollama", "vllm", "openai", "dashscope"],
+        index=0,
+        help="切换 LLM 后端（Ollama/vLLM 需本地运行模型服务）",
+    )
+    if llm_provider != config.llm.provider:
+        os.environ["LLM_PROVIDER"] = llm_provider
+        config.llm.provider = llm_provider
+        # Force re-init agent on next use
+        if "agent" in st.session_state:
+            del st.session_state.agent
+        st.rerun()
+    if llm_provider == "ollama":
+        ollama_model = st.text_input("Ollama Model", value="qwen3:8b",
+                                      help="e.g. qwen3:8b, qwen2.5:14b, llama3.1:8b")
+        os.environ["LLM_MODEL"] = ollama_model
+    st.caption(f"当前: {config.llm.provider} / {config.llm.model}")
+
+    st.divider()
     st.subheader("论文设置")
     max_papers = st.slider("最多下载论文数", 1, 15, 5)
     categories = st.multiselect(
@@ -132,6 +153,9 @@ if "conversation_memory" not in st.session_state:
 # 预加载 Embedding 模型 + Reranker（启动时加载，用户点击按钮时模型已在内存）
 # 避免首次查询需要等待 60+ 秒加载模型
 if not st.session_state.get("_model_loaded"):
+    # 离线模式：避免 huggingface.co 连接超时阻塞
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     with st.spinner("🚀 加载 AI 模型中（首次约 20 秒，后续秒回）..."):
         st.session_state.pipeline.load_index()
         if st.session_state.pipeline.vector_store.count > 0:
@@ -147,6 +171,33 @@ if not st.session_state.get("_model_loaded"):
 # ============================================================
 with tab1:
     st.header("🔍 搜索 ArXiv 论文")
+
+    # ── 本地上传 PDF ──
+    with st.expander("📤 上传本地 PDF", expanded=False):
+        uploaded_files = st.file_uploader(
+            "选择 PDF 文件（支持多文件）",
+            type=["pdf"],
+            accept_multiple_files=True,
+        )
+        if uploaded_files:
+            import shutil
+            papers_dir = get_papers_dir()
+            uploaded_names = []
+            for f in uploaded_files:
+                safe_name = f.name.replace(" ", "_")
+                dest = papers_dir / safe_name
+                with open(str(dest), "wb") as out:
+                    out.write(f.getbuffer())
+                uploaded_names.append(safe_name)
+            if uploaded_names:
+                st.success(f"已上传 {len(uploaded_names)} 篇：{'、'.join(uploaded_names)}")
+                if st.button("🚀 解析并构建索引", key="build_uploaded"):
+                    pipeline = st.session_state.pipeline
+                    with st.spinner("解析并构建索引中..."):
+                        paths = [str(papers_dir / n) for n in uploaded_names]
+                        pipeline.build_index(paths, rebuild=False, max_workers=1)
+                    st.success(f"✅ 索引完成！当前共 {pipeline.vector_store.count} 个 chunks")
+                    st.rerun()
 
     col1, col2 = st.columns([3, 1])
     with col1:
@@ -401,10 +452,35 @@ with tab3:
             st.session_state.conversation_memory = ConversationMemory()
             st.rerun()
 
+    # ── 论文选择（放聊天输入框上方） ──
+    from src.retriever.paper_registry import PaperRegistry
+    _reg = PaperRegistry()
+    _all_papers = _reg.list_papers()
+    _paper_options = [(p, p.replace(".pdf","").replace("_"," ")[:60]) for p in _all_papers]
+    if "selected_papers" not in st.session_state:
+        st.session_state.selected_papers = []
+    selected = []
+    sel_cols = st.columns([1, 4])
+    with sel_cols[0]:
+        sel_label = st.markdown("**📚 论文：**")
+    with sel_cols[1]:
+        sel_all = st.checkbox("全选", value=(len(st.session_state.selected_papers)==len(_all_papers)), key="sel_all")
+    sel_rows = [st.columns([2,2,2,2,2]) for _ in range((len(_paper_options)+4)//5)]
+    for i, (src, display) in enumerate(_paper_options):
+        row_idx, col_idx = i // 5, i % 5
+        with sel_rows[row_idx][col_idx]:
+            checked = st.checkbox(display, value=(src in st.session_state.selected_papers or sel_all), key=f"sel_{src}")
+            if checked:
+                selected.append(src)
+    if not sel_all:
+        st.session_state.selected_papers = selected
+    else:
+        st.session_state.selected_papers = [p[0] for p in _paper_options]
+    st.caption(f"已选 {len(st.session_state.selected_papers)} 篇" if st.session_state.selected_papers else "未选择 → 搜索全部论文")
+
     for msg in st.session_state.chat_messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
-            # 显示表格 HTML 内容
             if msg.get("tables"):
                 for ti, meta in enumerate(msg["tables"]):
                     html_raw = meta.get("full_html_content", "")
@@ -423,25 +499,22 @@ with tab3:
             st.markdown(question)
 
         with st.chat_message("assistant"):
-            log = st.status("🚀 处理中…", expanded=False)
+            with st.spinner("🤔 思考中…"):
+                ok, msg = pipeline.ensure_index(client)
+                if not ok:
+                    st.warning(msg); st.stop()
 
-            log.write("📂 检查索引…")
-            ok, msg = pipeline.ensure_index(client)
-            if not ok:
-                log.write(f"❌ {msg}"); log.update(state="error"); st.warning(msg); st.stop()
-            log.write(f"✅ {pipeline.vector_store.count} 条向量")
+                # 从已选论文构造 paper_filter
+                _sel = st.session_state.get("selected_papers", [])
+                _paper_filter = {"source__keyword": _sel[0].replace(".pdf","")} if len(_sel) == 1 else None
+                results = pipeline.query(
+                    question,
+                    top_k=config.retrieval.top_k_rerank if use_rerank else top_k,
+                    use_rerank=use_rerank, alpha=alpha, rewrite=use_rewrite,
+                    chat_history=st.session_state.chat_messages,
+                )
 
-            log.write("🔍 检索…"); log.update(label="检索中…")
-            start = time.time()
-            results = pipeline.query(
-                question,
-                top_k=config.retrieval.top_k_rerank if use_rerank else top_k,
-                use_rerank=use_rerank, alpha=alpha, rewrite=use_rewrite,
-                chat_history=st.session_state.chat_messages,
-            )
-            log.write(f"✅ {len(results)} 条, {(time.time()-start)*1000:.0f}ms")
-
-            log.write("🤖 生成回答…"); log.update(label="生成中…")
+            # 不走 st.status，直接显示答案
             table_chunks = []; figure_chunks = []; answer = None
 
             # ── 额外搜图床：Figure/Table 原图匹配 ──
@@ -546,16 +619,13 @@ with tab3:
                 from src.prompts import QA_SYSTEM_PROMPT, TABLE_SYSTEM_PROMPT
                 from src.config import get_llm_client
                 llm = get_llm_client()
-                # 检测是否显式问章节（结论/方法/实验/Introduction/数字节号）→ 不显示表格
+                # 只当用户显式问 "表" 时才显示表格 HTML
                 import re as _re
-                _asks_section = bool(_re.search(r'(?:Conclusion|Introduction|Method|Experiment|Related\s*Work|Background|Discussion)|\d+\.\s*(?:Conclusion|Introduction|Method)', question, _re.IGNORECASE))
-                for r in results[:5]:
+                _show_table = bool(_re.search(r'\b(?:[Tt]able|表格|表\s*\d)', question))
+                for r in results[:15]:
                     meta = r.get("metadata", {}) if isinstance(r, dict) else {}
-                    if meta.get("is_table") and meta.get("full_html_content"):
-                        if _asks_section:
-                            pass  # 问章节时跳过表格
-                        else:
-                            table_chunks.append(meta)
+                    if _show_table and meta.get("is_table") and meta.get("full_html_content"):
+                        table_chunks.append(meta)
 
                 def _shorten(s):
                     name = s.replace('.pdf','').replace('_',' ')
@@ -568,11 +638,11 @@ with tab3:
                 def _extract_text(r):
                     meta = r.get("metadata", {}) if isinstance(r, dict) else {}
                     full = meta.get("full_html_content", "")
-                    return full[:2000] if full else (r.get("text","") if isinstance(r,dict) else "")[:1000]
+                    return full[:2000] if full else (r.get("text","") if isinstance(r,dict) else "")[:1500]
 
                 prompt = TABLE_SYSTEM_PROMPT if table_chunks else QA_SYSTEM_PROMPT
                 ctx_parts = []
-                for r in results[:5]:
+                for r in results[:15]:  # 加大上下文量，确保跨论文数据被包含
                     meta = r.get("metadata", {}) if isinstance(r, dict) else {}
                     src = _shorten(r.get("source", "?"))
                     sec = meta.get("section_title", "") or meta.get("section_id", "")
@@ -611,28 +681,61 @@ with tab3:
                     else:
                         user_content = text_part
 
-                    resp = llm.chat.completions.create(
-                        model=config.llm.model,
-                        messages=[{"role":"system","content":prompt}, *hist,
-                                  {"role":"user","content":user_content}],
-                        temperature=config.llm.temperature, max_tokens=2048)
-                    answer = resp.choices[0].message.content
+                    # ── 流式生成（Streaming）──
+                    answer_placeholder = st.empty()
+                    collected = []
+                    try:
+                        stream = llm.chat.completions.create(
+                            model=config.llm.model,
+                            messages=[{"role":"system","content":prompt}, *hist,
+                                      {"role":"user","content":user_content}],
+                            temperature=config.llm.temperature, max_tokens=2048,
+                            stream=True)
+                        for chunk in stream:
+                            if chunk.choices[0].delta.content:
+                                collected.append(chunk.choices[0].delta.content)
+                                answer_placeholder.markdown("".join(collected))
+                        answer = "".join(collected)
+                    except Exception as e:
+                        answer = f"生成失败: {e}"
                 except Exception as e:
                     answer = f"生成失败: {e}"
 
             if answer:
-                log.update(label="✅ 完成", state="complete", expanded=False)
+                # Save for RAGAS eval
+                st.session_state.last_qa_question = question
+                st.session_state.last_qa_answer = answer
+                st.session_state.last_qa_contexts = results[:15] if results else []
+
+            if answer:
+                pass  # 完成
+
+                # 回答内容
                 st.markdown(answer)
 
-                # 显示表格 HTML 内容
+                # 表格 HTML 内容
                 for ti, meta in enumerate(table_chunks):
                     html_raw = meta.get("full_html_content", "")
                     if html_raw:
                         html_clean = html_raw.replace("[TABLE_HTML:","").replace("[/TABLE_HTML]","").strip()
                         st.caption(f"📊 {meta.get('table_id',f'表格{ti+1}')}")
                         st.markdown(html_clean, unsafe_allow_html=True)
+
+                # APA 导出（从回答中提取参考来源）
+                ref_match = _re.search(r'---\s*\n\*\*参考来源\*\*(.*?)$', answer, _re.DOTALL)
+                if ref_match:
+                    ref_text = ref_match.group(1).strip()
+                    with st.expander("📚 查看参考文献 (APA)", expanded=False):
+                        st.text(ref_text)
+                        try:
+                            import pyperclip as _pc
+                            if st.button("📋 复制 APA 格式", key=f"apa_{int(time.time())}"):
+                                _pc.copy(ref_text)
+                                st.toast("✅ 已复制到剪贴板")
+                        except Exception:
+                            st.code(ref_text, language="text")
             else:
-                log.update(label="⚠️ 无结果", state="error"); answer = "未检索到相关内容。"; st.markdown(answer)
+                answer = "未检索到相关内容。"; st.markdown(answer)
 
             st.session_state.chat_messages.append({"role":"user","content":question})
             st.session_state.chat_messages.append({"role":"assistant","content":answer,"tables":table_chunks if table_chunks else []})
@@ -668,6 +771,55 @@ with tab4:
                 cols[i].metric(k, f"{val:.4f}" if isinstance(val, float) else val)
         else:
             st.info("指标计算需要标注的相关文档 ID（ground truth），可通过 evaluate 模块设置。")
+
+    st.divider()
+    st.subheader("生成质量评估 (RAGAS)")
+
+    if "ragas_results" not in st.session_state:
+        st.session_state.ragas_results = []
+
+    col_a, col_b = st.columns([3, 1])
+    with col_a:
+        st.markdown(
+            "评估 LLM 生成答案的 Faithfulness（忠实度）、"
+            "Answer Relevancy（答案相关性）和 Context Precision（上下文精度）。"
+        )
+    with col_b:
+        if st.button("🧪 运行 RAGAS 评估", use_container_width=True):
+            if st.session_state.get("last_qa_contexts") and st.session_state.get("last_qa_answer"):
+                with st.spinner("LLM 评估中..."):
+                    try:
+                        from src.evaluation.ragas_eval import RAGASEvaluator
+                        evaluator = RAGASEvaluator()
+                        result = evaluator.evaluate_rag_response(
+                            question=st.session_state.get("last_qa_question", ""),
+                            answer=st.session_state.last_qa_answer,
+                            retrieved_chunks=st.session_state.last_qa_contexts,
+                        )
+                        st.session_state.ragas_results.insert(0, {
+                            "question": result.question[:80],
+                            "faithfulness": result.faithfulness,
+                            "answer_relevancy": result.answer_relevancy,
+                            "context_precision": result.context_precision,
+                            "error": result.error,
+                        })
+                        if len(st.session_state.ragas_results) > 10:
+                            st.session_state.ragas_results = st.session_state.ragas_results[:10]
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"RAGAS 评估失败: {e}")
+            else:
+                st.warning("请先在「论文问答」Tab 中进行一次问答")
+
+    if st.session_state.ragas_results:
+        for i, r in enumerate(st.session_state.ragas_results[:5]):
+            cols = st.columns([3, 1, 1, 1])
+            cols[0].markdown(f"**Q{i+1}:** {r['question']}")
+            cols[1].metric("Faith.", f"{r['faithfulness']:.2f}", help="回答是否基于检索上下文")
+            cols[2].metric("Relev.", f"{r['answer_relevancy']:.2f}", help="回答是否切题")
+            cols[3].metric("Ctx Prec.", f"{r['context_precision']:.2f}", help="上下文是否相关")
+    else:
+        st.info("点击「运行 RAGAS 评估」按钮，基于最近一次问答结果评估生成质量")
 
     st.divider()
     st.subheader("Langfuse 集成")
